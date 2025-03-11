@@ -6,6 +6,7 @@ import syncService from '../services/sync.service.js';
 import photosService from '../services/photos.service.js';
 import logger from '../services/logger.service.js';
 import websocketService from '../services/websocket.service.js';
+import path from 'path';
 
 const router = express.Router();
 
@@ -88,7 +89,7 @@ router.post('/logout', (req, res) => {
 // Settings routes
 router.get('/settings', (req, res) => {
     try {
-        const settings = settingsService.loadSettings();
+        const settings = settingsService.getSettings();
         res.json(settings);
     } catch (error) {
         logger.error('Error reading settings:', error);
@@ -96,10 +97,10 @@ router.get('/settings', (req, res) => {
     }
 });
 
-router.post('/settings', (req, res) => {
+router.post('/settings', async (req, res) => {
     try {
-        settingsService.saveSettings(req.body);
-        res.json({ success: true });
+        const updatedSettings = await settingsService.updateSettings(req.body);
+        res.json(updatedSettings);
     } catch (error) {
         logger.error('Error saving settings:', error);
         res.status(500).json({ error: 'Failed to save settings' });
@@ -159,7 +160,7 @@ router.post('/sync/pause', (req, res) => {
 
 router.post('/sync/resume', (req, res) => {
     try {
-        if (websocketService.currentSync.status === 'paused') {
+        if (websocketService.currentSync.status === 'paused' || websocketService.currentSync.isPaused) {
             websocketService.updateSyncStatus({
                 isPaused: false,
                 status: 'running'
@@ -207,15 +208,17 @@ router.post('/discover', async (req, res) => {
             });
         }
         
-        const settings = settingsService.loadSettings();
+        const settings = settingsService.getSettings();
         const discoveryOptions = {
             ...settings,
             continueDiscovery: req.body?.continueDiscovery || false,
-            pageToken: req.body?.pageToken || null
+            pageToken: req.body?.pageToken || null,
+            syncDir: settings.syncDir || path.join(process.cwd(), 'photos'),
+            forceFreshDiscovery: req.body?.forceFreshDiscovery || false
         };
         
         // Reset the photos service state before starting new discovery
-        if (!discoveryOptions.continueDiscovery) {
+        if (!discoveryOptions.continueDiscovery && !discoveryOptions.forceFreshDiscovery) {
             photosService.resetState();
         }
         

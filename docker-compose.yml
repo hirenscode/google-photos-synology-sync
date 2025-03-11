@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  google-photos-sync:
+    build: .
+    container_name: google-photos-sync
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ${SYNOLOGY_PHOTOS_DIR:-/volume1/photos}:/data/photos
+      - ${SYNOLOGY_CONFIG_DIR:-/volume1/docker/google-photos-sync/config}:/data/config
+    environment:
+      - NODE_ENV=production
+      - TZ=${TZ:-UTC}
+      - CLIENT_ID=${CLIENT_ID}
+      - CLIENT_SECRET=${CLIENT_SECRET}
+      - REDIRECT_URI=${REDIRECT_URI}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s 

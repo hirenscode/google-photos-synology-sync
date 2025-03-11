@@ -1,146 +1,139 @@
-import fs from 'fs';
-import { PATHS, DEFAULT_SETTINGS } from '../config/constants.js';
+import fs from 'fs/promises';
+import path from 'path';
 import logger from './logger.service.js';
 
 class SettingsService {
     constructor() {
-        this.settings = null;
-        this.loadSettings();
+        this.settings = {
+            syncDir: path.join(process.cwd(), 'photos'), // Default sync directory
+            syncOrder: 'newest', // 'newest', 'oldest', 'random'
+            folderStructure: 'year/month', // 'year/month', 'year/month/date', 'year/month_date', 'year_month_date', 'flat'
+            autoOrganize: true, // Whether to automatically organize files during sync
+            batchSize: 50,
+            maxConcurrentDownloads: 3,
+            autoRetry: true,
+            retryAttempts: 3,
+            saveStateInterval: 5, // minutes
+            discoveryCacheTTL: 24 * 60 * 60 * 1000, // 24 hours in milliseconds
+            syncCacheTTL: 24 * 60 * 60 * 1000, // 24 hours in milliseconds
+            enableCaching: true // Whether to use caching at all
+        };
+        this.configPath = null;
     }
 
-    loadSettings() {
+    async initialize(configDir) {
+        this.configPath = path.join(configDir, 'settings.json');
         try {
-            if (fs.existsSync(PATHS.SETTINGS_PATH)) {
-                const settingsData = fs.readFileSync(PATHS.SETTINGS_PATH, 'utf8');
-                this.settings = JSON.parse(settingsData);
-                logger.info('Settings loaded successfully');
-            } else {
-                this.settings = { ...DEFAULT_SETTINGS };
-                this.saveSettings(this.settings);
-                logger.info('Default settings created and saved');
-            }
-            return this.settings;
+            await fs.access(this.configPath);
+            const data = await fs.readFile(this.configPath, 'utf8');
+            this.settings = { ...this.settings, ...JSON.parse(data) };
+            logger.info('Settings loaded successfully');
         } catch (error) {
-            logger.error('Error loading settings:', error);
-            this.settings = { ...DEFAULT_SETTINGS };
-            return this.settings;
+            if (error.code === 'ENOENT') {
+                await this.saveSettings();
+                logger.info('Created default settings file');
+            } else {
+                logger.error('Error loading settings:', error);
+            }
         }
     }
 
-    saveSettings(newSettings) {
+    async saveSettings() {
         try {
-            // Validate required fields
-            if (!newSettings.syncDir) {
-                throw new Error('syncDir is required');
-            }
-
-            // Merge with existing settings
-            this.settings = {
-                ...this.settings,
-                ...newSettings
-            };
-
-            // Ensure the sync directory exists
-            if (!fs.existsSync(this.settings.syncDir)) {
-                fs.mkdirSync(this.settings.syncDir, { recursive: true });
-            }
-
-            // Save to file
-            fs.writeFileSync(
-                PATHS.SETTINGS_PATH,
-                JSON.stringify(this.settings, null, 2)
-            );
-
+            await fs.writeFile(this.configPath, JSON.stringify(this.settings, null, 2));
             logger.info('Settings saved successfully');
-            return true;
         } catch (error) {
             logger.error('Error saving settings:', error);
             throw error;
         }
     }
 
+    async updateSettings(newSettings) {
+        this.settings = {
+            ...this.settings,
+            ...newSettings
+        };
+        await this.saveSettings();
+        return this.settings;
+    }
+
     getSettings() {
-        return this.settings || this.loadSettings();
+        return { ...this.settings };
     }
 
-    updateSettings(updates) {
-        try {
-            const newSettings = {
-                ...this.settings,
-                ...updates
-            };
-            return this.saveSettings(newSettings);
-        } catch (error) {
-            logger.error('Error updating settings:', error);
-            throw error;
-        }
-    }
+    // Helper method to generate folder path based on date and settings
+    generateFolderPath(date, baseDir) {
+        const year = date.getFullYear().toString();
+        const month = (date.getMonth() + 1).toString().padStart(2, '0');
+        const day = date.getDate().toString().padStart(2, '0');
 
-    validateSettings(settings) {
-        const errors = [];
-
-        // Check required fields
-        if (!settings.syncDir) {
-            errors.push('Sync directory is required');
-        }
-
-        // Validate date range if specified
-        if (settings.startDate && settings.endDate) {
-            const start = new Date(settings.startDate);
-            const end = new Date(settings.endDate);
-            if (start > end) {
-                errors.push('Start date must be before end date');
-            }
-        }
-
-        // Validate numeric values
-        if (settings.maxConcurrentDownloads && settings.maxConcurrentDownloads < 1) {
-            errors.push('Maximum concurrent downloads must be at least 1');
-        }
-
-        if (settings.retryAttempts && settings.retryAttempts < 0) {
-            errors.push('Retry attempts must be 0 or greater');
-        }
-
-        if (settings.retryDelay && settings.retryDelay < 0) {
-            errors.push('Retry delay must be 0 or greater');
-        }
-
-        if (settings.autoSyncInterval && settings.autoSyncInterval < 60000) {
-            errors.push('Auto sync interval must be at least 1 minute (60000 ms)');
-        }
-
-        return errors;
-    }
-
-    resetSettings() {
-        try {
-            this.settings = { ...DEFAULT_SETTINGS };
-            this.saveSettings(this.settings);
-            logger.info('Settings reset to defaults');
-            return true;
-        } catch (error) {
-            logger.error('Error resetting settings:', error);
-            throw error;
+        switch (this.settings.folderStructure) {
+            case 'year/month':
+                return path.join(baseDir, year, month);
+            
+            case 'year/month/date':
+                return path.join(baseDir, year, month, day);
+            
+            case 'year/month_date':
+                return path.join(baseDir, year, `${month}_${day}`);
+            
+            case 'year_month_date':
+                return path.join(baseDir, `${year}_${month}_${day}`);
+            
+            case 'flat':
+                return baseDir;
+            
+            default:
+                return path.join(baseDir, year, month);
         }
     }
 
-    async checkStorageSpace(folder) {
-        try {
-            const { stdout } = await execAsync(`df -h "${folder}"`);
-            const lines = stdout.split('\n');
-            const [, diskInfo] = lines;
-            const [, size, used, available, usePercent] = diskInfo.split(/\s+/);
-            return {
-                total: size,
-                used,
-                available,
-                usePercent: parseInt(usePercent)
-            };
-        } catch (error) {
-            console.error(`Error checking storage space: ${error.message}`);
-            return null;
+    // Get available settings options
+    getSettingsOptions() {
+        const isProduction = process.env.NODE_ENV === 'production';
+        const isSynology = fs.existsSync('/etc/synoinfo.conf') || fs.existsSync('/etc/synology_model_name');
+
+        let syncDirDescription = 'Directory where photos and videos will be synced';
+        if (isSynology) {
+            syncDirDescription = 'Select a shared folder or volume path on your Synology NAS (e.g., /volume1/photos or /var/services/homes/your-user/photos)';
+        } else if (isProduction) {
+            syncDirDescription = 'Select a permanent storage location with sufficient space for your photos and videos';
         }
+
+        return {
+            syncOrder: [
+                { value: 'newest', label: 'Newest First' },
+                { value: 'oldest', label: 'Oldest First' },
+                { value: 'random', label: 'Random Order' }
+            ],
+            folderStructure: [
+                { value: 'year/month', label: 'Year/Month (2012/08)' },
+                { value: 'year/month/date', label: 'Year/Month/Date (2012/08/29)' },
+                { value: 'year/month_date', label: 'Year/Month_Date (2012/08_29)' },
+                { value: 'year_month_date', label: 'Year_Month_Date (2012_08_29)' },
+                { value: 'flat', label: 'No Folders (Flat Structure)' }
+            ],
+            syncDir: {
+                type: 'string',
+                label: 'Sync Directory',
+                description: syncDirDescription,
+                default: path.join(process.cwd(), 'photos'),
+                isProduction: isProduction || isSynology,
+                examples: isSynology ? [
+                    '/volume1/photos',
+                    '/volume2/google-photos',
+                    '/var/services/homes/your-user/photos'
+                ] : []
+            },
+            cacheTTLOptions: [
+                { label: '1 hour', value: 60 * 60 * 1000 },
+                { label: '6 hours', value: 6 * 60 * 60 * 1000 },
+                { label: '12 hours', value: 12 * 60 * 60 * 1000 },
+                { label: '24 hours', value: 24 * 60 * 60 * 1000 },
+                { label: '48 hours', value: 48 * 60 * 60 * 1000 },
+                { label: '7 days', value: 7 * 24 * 60 * 60 * 1000 }
+            ]
+        };
     }
 }
 

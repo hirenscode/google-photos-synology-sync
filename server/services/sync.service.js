@@ -5,6 +5,7 @@ import { promisify } from 'util';
 import settingsService from './settings.service.js';
 import photosService from './photos.service.js';
 import websocketService from './websocket.service.js';
+import syncCacheService from './sync.cache.service.js';
 import logger from './logger.service.js';
 import axios from 'axios';
 
@@ -13,251 +14,346 @@ class SyncService {
         this.syncInProgress = false;
         this.currentBatch = [];
         this.pageToken = null;
+        // Check if we're running on Synology or in production
+        this.isProduction = process.env.NODE_ENV === 'production' || this.isRunningOnSynology();
+        this.verificationInProgress = false;
+    }
+
+    isRunningOnSynology() {
+        try {
+            // Check for Synology-specific paths or files
+            return fs.existsSync('/etc/synoinfo.conf') || fs.existsSync('/etc/synology_model_name');
+        } catch {
+            return false;
+        }
+    }
+
+    validateSyncDirectory(syncDir) {
+        if (!this.isProduction) {
+            return { isValid: true };
+        }
+
+        // In production/Synology, enforce proper sync directory selection
+        if (!syncDir || syncDir === 'photos' || syncDir === path.join(process.cwd(), 'photos')) {
+            return {
+                isValid: false,
+                error: 'Please select a proper sync directory in settings before starting sync. ' +
+                       'For Synology, this should typically be a shared folder or volume path.'
+            };
+        }
+
+        try {
+            // Check if directory exists and is writable
+            if (!fs.existsSync(syncDir)) {
+                return {
+                    isValid: false,
+                    error: `Sync directory "${syncDir}" does not exist. Please create it first or select a different location.`
+                };
+            }
+
+            // Try to write a test file to check permissions
+            const testFile = path.join(syncDir, '.write_test');
+            fs.writeFileSync(testFile, 'test');
+            fs.unlinkSync(testFile);
+
+            return { isValid: true };
+        } catch (error) {
+            return {
+                isValid: false,
+                error: `Cannot write to sync directory "${syncDir}". Please check permissions or select a different location.`
+            };
+        }
     }
 
     async getSyncStatus() {
         try {
+            // Initialize with default values in case photosService is not ready
+            const defaultStats = {
+                totalSynced: 0,
+                totalDiscovered: 0,
+                lastSyncTimestamp: null
+            };
+
+            let syncStats;
+            try {
+                syncStats = photosService.getSyncStats();
+            } catch (error) {
+                logger.warn('Could not get sync stats:', error);
+                syncStats = defaultStats;
+            }
+
             return {
-                status: websocketService.currentSync.status,
+                status: websocketService.currentSync.status || 'idle',
                 progress: websocketService.currentSync.totalItems > 0 
                     ? Math.round((websocketService.currentSync.processedItems / websocketService.currentSync.totalItems) * 100)
                     : 0,
-                totalItems: websocketService.currentSync.totalItems,
-                processedItems: websocketService.currentSync.processedItems,
-                isPaused: websocketService.currentSync.isPaused,
-                isCancelled: websocketService.currentSync.isCancelled,
-                message: websocketService.currentSync.message
+                totalItems: websocketService.currentSync.totalItems || 0,
+                processedItems: websocketService.currentSync.processedItems || 0,
+                isPaused: websocketService.currentSync.isPaused || false,
+                isCancelled: websocketService.currentSync.isCancelled || false,
+                message: websocketService.currentSync.message || 'Ready to sync',
+                syncedFiles: syncStats.totalSynced || 0,
+                remainingFiles: (syncStats.totalDiscovered || 0) - (syncStats.totalSynced || 0),
+                lastSyncTimestamp: syncStats.lastSyncTimestamp,
+                syncDir: settingsService.getSettings().syncDir
             };
         } catch (error) {
             logger.error('Error getting sync status:', error);
+            // Return a minimal status instead of throwing
+            return {
+                status: 'error',
+                message: 'Error getting sync status',
+                error: error.message
+            };
+        }
+    }
+
+    async downloadItem(item, syncDir) {
+        try {
+            // Check if item is already synced
+            const cachedItem = syncCacheService.getItem(item.id);
+            if (cachedItem && fs.existsSync(cachedItem.localPath)) {
+                logger.info(`Item ${item.id} already synced at ${cachedItem.localPath}`);
+                return { success: true, skipped: true };
+            }
+
+            const fileName = await photosService.generateFileName(item);
+            const filePath = path.join(syncDir, fileName);
+
+            // Download the file
+            const response = await axios({
+                method: 'get',
+                url: item.baseUrl,
+                responseType: 'stream'
+            });
+
+            const writer = fs.createWriteStream(filePath);
+            response.data.pipe(writer);
+
+            await new Promise((resolve, reject) => {
+                writer.on('finish', resolve);
+                writer.on('error', reject);
+            });
+
+            // Update sync cache with the new item
+            syncCacheService.updateItem(item.id, {
+                localPath: filePath,
+                fileName: fileName,
+                mediaMetadata: item.mediaMetadata,
+                mimeType: item.mimeType
+            });
+
+            return { success: true, filePath };
+        } catch (error) {
+            logger.error(`Error downloading item ${item.id}:`, error);
+            return { success: false, error: error.message };
+        }
+    }
+
+    async verifyExistingFiles(syncDir, discoveryItems) {
+        try {
+            if (this.verificationInProgress) {
+                logger.warn('Verification already in progress');
+                return;
+            }
+
+            this.verificationInProgress = true;
+            logger.info('Starting verification of existing files...');
+            websocketService.updateSyncStatus({
+                status: 'verifying',
+                message: 'Verifying existing files...',
+                progress: 0
+            });
+
+            // Get all files recursively from sync directory
+            const getAllFiles = async (dir) => {
+                const files = await fs.promises.readdir(dir, { withFileTypes: true });
+                const paths = await Promise.all(files.map(async (file) => {
+                    const filePath = path.join(dir, file.name);
+                    if (file.isDirectory()) {
+                        return getAllFiles(filePath);
+                    }
+                    return filePath;
+                }));
+                return paths.flat();
+            };
+
+            const existingFiles = await getAllFiles(syncDir);
+            const totalFiles = existingFiles.length;
+            let verifiedCount = 0;
+
+            // Match existing files with discovery items
+            for (const filePath of existingFiles) {
+                if (websocketService.currentSync.isCancelled) {
+                    break;
+                }
+
+                const fileName = path.basename(filePath);
+                // Find matching discovery item by comparing file names or patterns
+                const matchingItem = discoveryItems.find(item => {
+                    const expectedFileName = photosService.generateFileName(item);
+                    return fileName === expectedFileName;
+                });
+
+                if (matchingItem) {
+                    // Update sync cache with verified file
+                    syncCacheService.updateItem(matchingItem.id, {
+                        localPath: filePath,
+                        fileName: fileName,
+                        mediaMetadata: matchingItem.mediaMetadata,
+                        mimeType: matchingItem.mimeType,
+                        verified: true
+                    });
+                }
+
+                verifiedCount++;
+                const progress = Math.round((verifiedCount / totalFiles) * 100);
+                websocketService.updateSyncStatus({
+                    status: 'verifying',
+                    progress,
+                    message: `Verified ${verifiedCount} of ${totalFiles} files`
+                });
+            }
+
+            logger.info(`Verification complete. Found ${syncCacheService.syncCache.size} matching files`);
+            return syncCacheService.syncCache.size;
+
+        } catch (error) {
+            logger.error('Error verifying existing files:', error);
             throw error;
+        } finally {
+            this.verificationInProgress = false;
         }
     }
 
     async startSync(auth) {
-        if (this.syncInProgress) {
-            throw new Error('Sync is already in progress');
-        }
-
         try {
             this.syncInProgress = true;
-            websocketService.resetSyncStatus();
+            websocketService.updateSyncStatus({
+                status: 'initializing',
+                progress: 0,
+                message: 'Initializing sync process...'
+            });
 
-            // Load settings
-            const settings = settingsService.loadSettings();
-            const syncDir = settings.syncDir || 'photos';
-            
+            const settings = settingsService.getSettings();
+            const syncDir = settings.syncDir || path.join(process.cwd(), 'photos');
+
+            // Validate sync directory
+            const validation = this.validateSyncDirectory(syncDir);
+            if (!validation.isValid) {
+                throw new Error(validation.error);
+            }
+
             // Create sync directory if it doesn't exist
             if (!fs.existsSync(syncDir)) {
                 fs.mkdirSync(syncDir, { recursive: true });
             }
 
-            // Check if any sync type is enabled
-            if (!settings.syncPhotos && !settings.syncVideos) {
-                throw new Error('Both photos and videos are disabled in settings. Enable at least one type to sync.');
-            }
-
-            // Check storage space
-            const storage = await this.checkStorageSpace(syncDir);
-            if (storage && storage.usePercent > 90) {
-                logger.warn('Storage space is running low!');
-                if (settings.notificationEmail) {
-                    // TODO: Implement email notification service
-                    logger.info(`Would send email to ${settings.notificationEmail} about low storage`);
-                }
-            }
+            // Get discovery results
+            let discoveryResults = photosService.getDiscoveryResults();
             
-            websocketService.updateSyncStatus({
-                status: 'running',
-                message: 'Starting sync process...'
-            });
-
-            // Get photos from discovery results
-            const discoveryResults = photosService.getDiscoveryResults();
+            // If no discovery results, try to load from cache
             if (!discoveryResults || !discoveryResults.items || discoveryResults.items.length === 0) {
-                throw new Error('No photos found to sync. Run discovery first.');
+                logger.info('No discovery results found, checking discovery cache...');
+                await photosService.loadDiscoveryCache();
+                discoveryResults = photosService.getDiscoveryResults();
+                
+                if (!discoveryResults || !discoveryResults.items || discoveryResults.items.length === 0) {
+                    throw new Error('No items found in discovery cache. Please run discovery first.');
+                }
+                logger.info(`Loaded ${discoveryResults.items.length} items from discovery cache`);
             }
 
-            const photos = discoveryResults.items;
-            logger.info(`Found ${photos.length} items to sync`);
-            
-            websocketService.updateSyncStatus({
-                totalItems: photos.length,
-                message: `Found ${photos.length} items to sync`
+            // Verify existing files against discovery results
+            await this.verifyExistingFiles(syncDir, discoveryResults.items);
+
+            // Filter out already synced and verified items
+            const itemsToSync = discoveryResults.items.filter(item => {
+                const cachedItem = syncCacheService.getItem(item.id);
+                return !cachedItem || !cachedItem.verified || !fs.existsSync(cachedItem.localPath);
             });
 
-            // Prepare download queue with full media details
-            logger.info('Preparing download queue...');
-            const queue = await Promise.all(photos.map(async photo => {
-                try {
-                    const isVideo = photo.mediaMetadata.video;
-                    const extension = isVideo ? '.mp4' : '.jpg';
-                    
-                    // Skip based on media type settings
-                    if ((!settings.syncPhotos && !isVideo) || (!settings.syncVideos && isVideo)) {
-                        return null;
-                    }
-                    
-                    // Construct the proper download URL
-                    const downloadUrl = isVideo ? 
-                        `${photo.baseUrl}=dv` : // Original video quality
-                        `${photo.baseUrl}=d`;   // Original photo quality
-                    
-                    return {
-                        id: photo.id,
-                        filename: `${photo.id}${extension}`,
-                        downloadUrl: downloadUrl,
-                        mediaType: isVideo ? 'video' : 'photo',
-                        width: photo.mediaMetadata.width,
-                        height: photo.mediaMetadata.height,
-                        creationTime: photo.mediaMetadata.creationTime
-                    };
-                } catch (error) {
-                    logger.error(`Error preparing item ${photo.id}:`, error);
-                    return null;
-                }
-            }));
-
-            // Filter out skipped and failed items
-            const validQueue = queue.filter(item => item !== null);
-            logger.info(`Prepared ${validQueue.length} items for download`);
-
-            if (validQueue.length === 0) {
-                logger.info('No items to download after filtering');
+            if (itemsToSync.length === 0) {
+                logger.info('All items are already synced and verified');
                 websocketService.updateSyncStatus({
                     status: 'completed',
-                    message: 'No items to download after filtering'
+                    progress: 100,
+                    message: 'All items are already synced and verified'
                 });
                 return;
             }
 
-            // Set up concurrent downloads
-            const concurrentDownloads = Math.min(settings.concurrentDownloads || 3, 5);
-            const activeDownloads = new Map(); // Using Map to store promises
+            logger.info(`Found ${itemsToSync.length} items to sync`);
+            websocketService.updateSyncStatus({
+                status: 'running',
+                progress: 0,
+                message: `Starting sync of ${itemsToSync.length} items...`
+            });
+
+            const totalItems = itemsToSync.length;
             let processedItems = 0;
 
-            while ((validQueue.length > 0 || activeDownloads.size > 0) && !websocketService.currentSync.isCancelled) {
-                if (websocketService.currentSync.isPaused) {
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                    continue;
+            // Process items in batches
+            for (const item of itemsToSync) {
+                if (websocketService.currentSync.isCancelled) {
+                    break;
                 }
 
-                // Start new downloads if possible
-                while (validQueue.length > 0 && 
-                       activeDownloads.size < concurrentDownloads && 
-                       !websocketService.currentSync.isPaused && 
-                       !websocketService.currentSync.isCancelled) {
-                    const item = validQueue.shift();
-                    const filepath = path.join(syncDir, item.filename);
-                    
-                    if (!fs.existsSync(filepath)) {
-                        logger.info(`Starting download of ${item.mediaType}: ${item.filename} (${item.width}x${item.height})`);
-                        
-                        // Create download promise
-                        const downloadPromise = this.downloadItem(item, filepath, settings)
-                            .then(() => {
-                                processedItems++;
-                                websocketService.updateSyncStatus({
-                                    processedItems: processedItems,
-                                    message: `Downloaded ${item.filename}`
-                                });
-                            })
-                            .catch(error => {
-                                logger.error(`Error downloading ${item.filename}:`, error);
-                            })
-                            .finally(() => {
-                                activeDownloads.delete(item.id);
-                            });
-                        
-                        activeDownloads.set(item.id, downloadPromise);
-                    } else {
-                        processedItems++;
-                        websocketService.updateSyncStatus({
-                            processedItems: processedItems,
-                            message: `Skipped: ${item.filename} (already exists)`
+                if (websocketService.currentSync.isPaused) {
+                    await new Promise(resolve => {
+                        const checkPause = setInterval(() => {
+                            if (!websocketService.currentSync.isPaused) {
+                                clearInterval(checkPause);
+                                resolve();
+                            }
+                        }, 1000);
+                    });
+                }
+
+                const result = await this.downloadItem(item, syncDir);
+                processedItems++;
+
+                // Update progress
+                const progress = Math.round((processedItems / totalItems) * 100);
+                websocketService.updateSyncStatus({
+                    status: 'running',
+                    progress,
+                    processedItems,
+                    totalItems,
+                    message: result.skipped ? 
+                        `Skipped ${result.filePath} (already synced)` : 
+                        `Synced ${result.filePath}`
+                });
+
+                // Mark item as verified after successful sync
+                if (result.success) {
+                    const cachedItem = syncCacheService.getItem(item.id);
+                    if (cachedItem) {
+                        syncCacheService.updateItem(item.id, {
+                            ...cachedItem,
+                            verified: true
                         });
                     }
                 }
-
-                // Wait for at least one download to complete
-                if (activeDownloads.size > 0) {
-                    await Promise.race(activeDownloads.values());
-                }
             }
 
-            // Wait for remaining downloads to complete
-            if (activeDownloads.size > 0) {
-                await Promise.all(activeDownloads.values());
-            }
+            // Clean up old cache entries
+            await syncCacheService.cleanup();
 
-            // Handle cleanup if enabled
-            if (!websocketService.currentSync.isCancelled && settings.cleanupRemovedFiles) {
-                await this.cleanupRemovedFiles(syncDir, photos);
-            }
+            websocketService.updateSyncStatus({
+                status: 'completed',
+                progress: 100,
+                message: `Sync completed. ${processedItems} items processed.`
+            });
 
-            // Update final status
-            if (websocketService.currentSync.isCancelled) {
-                websocketService.updateSyncStatus({
-                    status: 'cancelled',
-                    message: 'Sync cancelled by user'
-                });
-            } else if (websocketService.currentSync.isPaused) {
-                websocketService.updateSyncStatus({
-                    status: 'paused',
-                    message: 'Sync paused by user'
-                });
-            } else {
-                websocketService.updateSyncStatus({
-                    status: 'completed',
-                    message: `Sync completed. Processed ${processedItems} items.`
-                });
-            }
         } catch (error) {
             logger.error('Sync error:', error);
             websocketService.updateSyncStatus({
                 status: 'error',
-                message: `Sync error: ${error.message}`
+                message: error.message
             });
         } finally {
             this.syncInProgress = false;
-        }
-    }
-
-    async downloadItem(item, filepath, settings) {
-        try {
-            // Make a HEAD request to get the file size
-            const headResponse = await axios.head(item.downloadUrl);
-            const fileSize = headResponse.headers['content-length'];
-            const fileSizeMB = fileSize ? (fileSize / (1024 * 1024)).toFixed(2) : 'unknown';
-            logger.info(`File size: ${fileSizeMB} MB`);
-
-            // Download the file
-            const response = await axios({
-                method: 'GET',
-                url: item.downloadUrl,
-                responseType: 'stream'
-            });
-
-            await new Promise((resolve, reject) => {
-                const writer = fs.createWriteStream(filepath);
-                response.data.pipe(writer);
-                writer.on('finish', resolve);
-                writer.on('error', reject);
-            });
-
-            // Verify the downloaded file size
-            const downloadedSize = fs.statSync(filepath).size;
-            const downloadedSizeMB = (downloadedSize / (1024 * 1024)).toFixed(2);
-            logger.info(`Successfully downloaded ${item.filename} (${downloadedSizeMB} MB)`);
-
-            // Set file modification time to match creation time
-            const creationTime = new Date(item.creationTime);
-            await fs.promises.utimes(filepath, creationTime, creationTime);
-
-            return true;
-        } catch (error) {
-            logger.error(`Error downloading ${item.filename}:`, error);
-            throw error;
         }
     }
 

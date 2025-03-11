@@ -9,7 +9,8 @@ import {
   InputLabel,
   Grid,
   Typography,
-  Divider
+  Divider,
+  FormHelperText
 } from '@mui/material';
 
 const AdvancedSettings = ({ settings, onSettingsChange }) => {
@@ -28,41 +29,76 @@ const AdvancedSettings = ({ settings, onSettingsChange }) => {
           <FormControl fullWidth>
             <InputLabel>Organization Method</InputLabel>
             <Select
-              value={settings.organizationMethod}
-              onChange={handleChange('organizationMethod')}
+              value={settings.folderStructure}
+              onChange={handleChange('folderStructure')}
               label="Organization Method"
             >
+              <MenuItem value="year/month">Year/Month (2012/08)</MenuItem>
+              <MenuItem value="year/month/date">Year/Month/Date (2012/08/29)</MenuItem>
+              <MenuItem value="year/month_date">Year/Month_Date (2012/08_29)</MenuItem>
+              <MenuItem value="year_month_date">Year_Month_Date (2012_08_29)</MenuItem>
               <MenuItem value="flat">Flat Structure</MenuItem>
-              <MenuItem value="date">By Date (YYYY/MM/DD)</MenuItem>
-              <MenuItem value="album">By Album</MenuItem>
             </Select>
           </FormControl>
         </Grid>
         <Grid item xs={12}>
           <FormControl fullWidth>
-            <InputLabel>File Naming</InputLabel>
+            <InputLabel>Sync Order</InputLabel>
             <Select
-              value={settings.namingPattern}
-              onChange={handleChange('namingPattern')}
-              label="File Naming"
+              value={settings.syncOrder}
+              onChange={handleChange('syncOrder')}
+              label="Sync Order"
             >
-              <MenuItem value="original">Keep Original Names</MenuItem>
-              <MenuItem value="date">Date Based</MenuItem>
-              <MenuItem value="custom">Custom Pattern</MenuItem>
+              <MenuItem value="newest">Newest First (Default)</MenuItem>
+              <MenuItem value="oldest">Oldest First (Requires full library scan)</MenuItem>
+              <MenuItem value="random">Random Order</MenuItem>
             </Select>
+            <FormHelperText>
+              Note: Due to Google Photos API limitations, selecting "Oldest First" requires scanning your entire library before starting the sync.
+            </FormHelperText>
           </FormControl>
         </Grid>
-        {settings.namingPattern === 'custom' && (
-          <Grid item xs={12}>
-            <TextField
-              fullWidth
-              label="Custom Pattern"
-              value={settings.customPattern || ''}
-              onChange={handleChange('customPattern')}
-              helperText="Available variables: {date}, {id}, {album}, {index}"
-            />
-          </Grid>
-        )}
+        <Grid item xs={12}>
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={settings.autoOrganize}
+                onChange={handleChange('autoOrganize')}
+              />
+            }
+            label="Automatically organize files during sync"
+          />
+        </Grid>
+      </Grid>
+
+      <Divider sx={{ my: 4 }} />
+
+      <Typography variant="h6" gutterBottom>
+        Performance Settings
+      </Typography>
+      <Grid container spacing={3}>
+        <Grid item xs={12} md={6}>
+          <TextField
+            fullWidth
+            type="number"
+            label="Batch Size"
+            value={settings.batchSize}
+            onChange={handleChange('batchSize')}
+            inputProps={{ min: 10, max: 100 }}
+            helperText="Number of items to process in each batch (10-100)"
+          />
+        </Grid>
+        <Grid item xs={12} md={6}>
+          <TextField
+            fullWidth
+            type="number"
+            label="Concurrent Downloads"
+            value={settings.maxConcurrentDownloads}
+            onChange={handleChange('maxConcurrentDownloads')}
+            inputProps={{ min: 1, max: 10 }}
+            helperText="Maximum parallel downloads (1-10)"
+          />
+        </Grid>
       </Grid>
 
       <Divider sx={{ my: 4 }} />
@@ -133,16 +169,6 @@ const AdvancedSettings = ({ settings, onSettingsChange }) => {
             value={settings.bandwidthLimit}
             onChange={handleChange('bandwidthLimit')}
             inputProps={{ min: 0, step: 0.1 }}
-          />
-        </Grid>
-        <Grid item xs={12}>
-          <TextField
-            fullWidth
-            type="number"
-            label="Concurrent Downloads"
-            value={settings.concurrentDownloads}
-            onChange={handleChange('concurrentDownloads')}
-            inputProps={{ min: 1, max: 10 }}
           />
         </Grid>
         <Grid item xs={12}>

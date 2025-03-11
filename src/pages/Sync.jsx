@@ -31,6 +31,7 @@ import VideocamIcon from '@mui/icons-material/Videocam';
 import StorageIcon from '@mui/icons-material/Storage';
 import TimelineIcon from '@mui/icons-material/Timeline';
 import { useTheme } from '../context/ThemeContext';
+import { useWebSocket } from '../context/WebSocketContext';
 
 function Sync() {
   const [syncStatus, setSyncStatus] = useState(null);
@@ -38,18 +39,68 @@ function Sync() {
   const [loading, setLoading] = useState(true);
   const [discovering, setDiscovering] = useState(false);
   const [discoveryResults, setDiscoveryResults] = useState(null);
-  const [discoveryToken, setDiscoveryToken] = useState(null); // To track pagination for "Discover More"
+  const [discoveryToken, setDiscoveryToken] = useState(null);
+  const { 
+    status: wsStatus, 
+    error: wsError, 
+    sendMessage,
+    discoveryState,
+    syncState 
+  } = useWebSocket();
   const { isDarkMode } = useTheme();
   const muiTheme = useMuiTheme();
   const isMobile = useMediaQuery(muiTheme.breakpoints.down('sm'));
 
+  // Update local state when WebSocket context state changes
   useEffect(() => {
-    fetchSyncStatus();
-  }, []);
+    if (discoveryState) {
+      setDiscoveryResults(discoveryState);
+      setDiscovering(discoveryState.status === 'discovering');
+    }
+  }, [discoveryState]);
+
+  useEffect(() => {
+    if (syncState) {
+      setSyncStatus(syncState);
+      setLoading(false); // Stop loading when we receive sync state
+    }
+  }, [syncState]);
+
+  // Update loading state when WebSocket status changes
+  useEffect(() => {
+    if (wsStatus === 'connected' && syncState) {
+      setLoading(false);
+    } else if (wsStatus !== 'connected') {
+      setLoading(true);
+      // Reset discovering state when connection is lost
+      if (discovering) {
+        setDiscovering(false);
+        setError('Connection lost during discovery. Please try again when connection is restored.');
+      }
+    }
+  }, [wsStatus, syncState, discovering]);
+
+  // Request current states when component mounts or WebSocket reconnects
+  useEffect(() => {
+    if (wsStatus === 'connected') {
+      sendMessage('getDiscoveryProgress');
+      sendMessage('getSyncStatus');
+      // Clear error when connection is restored
+      setError(null);
+    }
+  }, [wsStatus, sendMessage]);
+
+  // Handle WebSocket connection status
+  useEffect(() => {
+    if (wsStatus !== 'connected') {
+      setError('Connecting to server... Please wait.');
+    } else {
+      setError(wsError || null);
+    }
+  }, [wsStatus, wsError]);
 
   const fetchSyncStatus = async () => {
     try {
-      setLoading(true);
       const response = await fetch('http://localhost:3000/sync/status');
       if (!response.ok) {
         throw new Error('Failed to fetch sync status');
@@ -57,16 +108,21 @@ function Sync() {
       const status = await response.json();
       setSyncStatus(status);
       setError(null);
+      setLoading(false);
     } catch (error) {
       console.error('Error fetching sync status:', error);
       setError('Failed to fetch sync status');
-    } finally {
       setLoading(false);
     }
   };
 
   const handleDiscover = async (continueDiscovery = false) => {
     try {
+      // Only set discovering if we're connected
+      if (wsStatus !== 'connected') {
+        throw new Error('Cannot start discovery: Server connection not established');
+      }
+
       setDiscovering(true);
       setError(null);
       
@@ -78,6 +134,9 @@ function Sync() {
       
       // Check authentication first
       const authResponse = await fetch('http://localhost:3000/check-auth');
+      if (!authResponse.ok) {
+        throw new Error('Authentication check failed');
+      }
       const authData = await authResponse.json();
       
       if (!authData.authenticated) {
@@ -107,7 +166,12 @@ function Sync() {
         throw new Error(data.error || 'Discovery failed');
       }
       
-      console.log('Discovery results:', data.discovery);
+      // Request current discovery progress
+      if (wsStatus === 'connected') {
+        sendMessage('getDiscoveryProgress');
+      } else {
+        throw new Error('WebSocket connection lost during discovery');
+      }
       
       // Store the next page token if there are more results
       if (data.discovery.hasMore && data.discovery.nextPageToken) {
@@ -119,16 +183,16 @@ function Sync() {
       // Update or merge discovery results
       if (continueDiscovery && discoveryResults) {
         // Merge with previous results
-        setDiscoveryResults({
+        setDiscoveryResults(prevResults => ({
           ...data.discovery,
-          totalItems: (discoveryResults.totalItems || 0) + data.discovery.totalItems,
-          photoCount: (discoveryResults.photoCount || 0) + data.discovery.photoCount,
-          videoCount: (discoveryResults.videoCount || 0) + data.discovery.videoCount,
-          filteredItems: (discoveryResults.filteredItems || 0) + data.discovery.filteredItems,
-          estimatedSizeBytes: (discoveryResults.estimatedSizeBytes || 0) + data.discovery.estimatedSizeBytes,
-          estimatedSizeMB: Math.round(((discoveryResults.estimatedSizeBytes || 0) + data.discovery.estimatedSizeBytes) / (1024 * 1024)),
-          pagesScanned: (discoveryResults.pagesScanned || 0) + data.discovery.pagesScanned
-        });
+          totalItems: (prevResults?.totalItems || 0) + data.discovery.totalItems,
+          photoCount: (prevResults?.photoCount || 0) + data.discovery.photoCount,
+          videoCount: (prevResults?.videoCount || 0) + data.discovery.videoCount,
+          filteredItems: (prevResults?.filteredItems || 0) + data.discovery.filteredItems,
+          estimatedSizeBytes: (prevResults?.estimatedSizeBytes || 0) + data.discovery.estimatedSizeBytes,
+          estimatedSizeMB: Math.round(((prevResults?.estimatedSizeBytes || 0) + data.discovery.estimatedSizeBytes) / (1024 * 1024)),
+          pagesScanned: (prevResults?.pagesScanned || 0) + data.discovery.pagesScanned
+        }));
       } else {
         // Set initial results
         setDiscoveryResults(data.discovery);
@@ -136,7 +200,6 @@ function Sync() {
     } catch (error) {
       console.error('Discovery error:', error);
       setError(error.message || 'Failed to discover photos');
-    } finally {
       setDiscovering(false);
     }
   };
@@ -179,14 +242,14 @@ function Sync() {
   const handlePauseResume = async () => {
     try {
       setError(null);
-      const endpoint = syncStatus?.isPaused ? '/sync/resume' : '/sync/pause';
-      const response = await fetch(`http://localhost:3000${endpoint}`, {
+      const endpoint = syncState?.isPaused ? 'resume' : 'pause';
+      const response = await fetch(`http://localhost:3000/sync/${endpoint}`, {
         method: 'POST'
       });
       
       if (!response.ok) {
         const data = await response.json();
-        throw new Error(data.error || `Failed to ${syncStatus?.isPaused ? 'resume' : 'pause'} sync`);
+        throw new Error(data.error || `Failed to ${endpoint} sync`);
       }
       
       // Update sync status after pausing/resuming
@@ -229,6 +292,28 @@ function Sync() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
   }
 
+  // Update the discovery progress display in the UI
+  const renderDiscoveryProgress = () => {
+    if (!discoveryState || discoveryState.status === 'idle') return null;
+
+    const { photoCount = 0, videoCount = 0, estimatedSizeBytes = 0, pagesScanned = 0 } = discoveryState;
+    const formattedSize = formatBytes(estimatedSizeBytes);
+
+    return (
+      <Alert severity="info" sx={{ mt: 2 }}>
+        <Typography>
+          Discovered {photoCount} photos and {videoCount} videos ({formattedSize}) in {pagesScanned} pages
+          {discoveryState.status === 'discovering' && ' - Discovery in progress...'}
+        </Typography>
+        {wsStatus !== 'connected' && (
+          <Typography color="error" sx={{ mt: 1 }}>
+            ⚠️ Connection lost. Trying to reconnect... Progress updates may be delayed.
+          </Typography>
+        )}
+      </Alert>
+    );
+  };
+
   if (loading) {
     return (
       <Box sx={{ py: 4, textAlign: 'center' }}>
@@ -236,15 +321,20 @@ function Sync() {
         <Typography variant="body1" sx={{ mt: 2 }}>
           Loading sync status...
         </Typography>
+        {wsStatus !== 'connected' && (
+          <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+            Connecting to server...
+          </Typography>
+        )}
       </Box>
     );
   }
 
   // Check if sync button should be enabled
-  const syncEnabled = discoveryResults && 
-    discoveryResults.totalItems > 0 && 
-    syncStatus?.status !== 'running' && 
-    syncStatus?.status !== 'paused';
+  const syncEnabled = discoveryState && 
+    discoveryState.totalItems > 0 && 
+    syncState?.status !== 'running' && 
+    syncState?.status !== 'paused';
 
   return (
     <Box>
@@ -257,11 +347,13 @@ function Sync() {
         Sync Management
       </Typography>
 
-      {error && (
+      {(error || wsError) && (
         <Alert severity="error" sx={{ mb: 3 }}>
-          {error}
+          {error || wsError}
         </Alert>
       )}
+
+      {renderDiscoveryProgress()}
 
       <Grid container spacing={3}>
         {/* Discovery Panel */}
@@ -277,14 +369,14 @@ function Sync() {
               You can discover in chunks to ensure you have enough space.
             </Typography>
             
-            {discovering ? (
+            {discoveryState?.status === 'discovering' ? (
               <Box sx={{ textAlign: 'center', py: 3 }}>
                 <CircularProgress size={40} />
                 <Typography variant="body2" sx={{ mt: 2 }}>
                   Discovering available media...
                 </Typography>
               </Box>
-            ) : discoveryResults ? (
+            ) : discoveryState?.totalItems > 0 ? (
               <Box sx={{ mt: 2 }}>
                 <Typography variant="body1" gutterBottom>
                   Discovery Results:
@@ -294,14 +386,14 @@ function Sync() {
                   <Grid item xs={6}>
                     <Card variant="outlined" sx={{ textAlign: 'center', py: 1 }}>
                       <PhotoLibraryIcon color="primary" />
-                      <Typography variant="h6">{discoveryResults.photoCount}</Typography>
+                      <Typography variant="h6">{discoveryState.photoCount}</Typography>
                       <Typography variant="body2">Photos</Typography>
                     </Card>
                   </Grid>
                   <Grid item xs={6}>
                     <Card variant="outlined" sx={{ textAlign: 'center', py: 1 }}>
                       <VideocamIcon color="secondary" />
-                      <Typography variant="h6">{discoveryResults.videoCount}</Typography>
+                      <Typography variant="h6">{discoveryState.videoCount}</Typography>
                       <Typography variant="body2">Videos</Typography>
                     </Card>
                   </Grid>
@@ -314,17 +406,17 @@ function Sync() {
                     </ListItemIcon>
                     <ListItemText 
                       primary="Total Items Found" 
-                      secondary={`${discoveryResults.totalItems} items${discoveryResults.hasMore ? ' (more available)' : ''}`}
+                      secondary={`${discoveryState.totalItems} items${discoveryState.hasMore ? ' (more available)' : ''}`}
                     />
                   </ListItem>
-                  {discoveryResults.dateFiltered && (
+                  {discoveryState.dateFiltered && (
                     <ListItem>
                       <ListItemIcon>
                         <TimelineIcon />
                       </ListItemIcon>
                       <ListItemText 
                         primary="After Date Filtering" 
-                        secondary={`${discoveryResults.filteredItems} items match your date range`}
+                        secondary={`${discoveryState.filteredItems} items match your date range`}
                       />
                     </ListItem>
                   )}
@@ -334,20 +426,20 @@ function Sync() {
                     </ListItemIcon>
                     <ListItemText 
                       primary="Estimated Size" 
-                      secondary={formatBytes(discoveryResults.estimatedSizeBytes)}
+                      secondary={formatBytes(discoveryState.estimatedSizeBytes)}
                     />
                   </ListItem>
                 </List>
                 
                 <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 2 }}>
                   <Typography variant="caption" color="text.secondary">
-                    Scanned {discoveryResults.pagesScanned} pages
+                    Scanned {discoveryState.pagesScanned} pages
                   </Typography>
                   <Box>
-                    {discoveryResults.hasMore && (
+                    {discoveryState.hasMore && (
                       <Button 
                         size="small" 
-                        onClick={handleDiscoverMore}
+                        onClick={() => handleDiscover(true)}
                         sx={{ mr: 1 }}
                       >
                         Discover More
@@ -385,13 +477,13 @@ function Sync() {
             </Typography>
             <Divider sx={{ mb: 2 }} />
             
-            {syncStatus && (
+            {syncState && (
               <Box sx={{ my: 2 }}>
                 <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 1 }}>
                   <Typography variant="body1">
-                    Status: <strong>{syncStatus.status}</strong>
+                    Status: <strong>{syncState.status}</strong>
                   </Typography>
-                  {syncStatus.isPaused && (
+                  {syncState.isPaused && (
                     <Chip
                       label="Paused"
                       color="warning"
@@ -400,100 +492,56 @@ function Sync() {
                   )}
                 </Box>
                 
-                {(syncStatus.status === 'running' || syncStatus.status === 'paused') && (
+                {(syncState.status === 'running' || syncState.status === 'paused') && (
                   <Box sx={{ width: '100%', mb: 2 }}>
                     <LinearProgress 
                       variant="determinate" 
-                      value={syncStatus.progress}
+                      value={syncState.progress || 0}
                       sx={{
-                        opacity: syncStatus.status === 'paused' ? 0.5 : 1,
+                        opacity: syncState.status === 'paused' ? 0.5 : 1,
                         height: 10,
                         borderRadius: 5
                       }}
                     />
-                    <Typography 
-                      variant="body2" 
-                      color="text.secondary" 
-                      align="center"
-                      sx={{ mt: 1 }}
-                    >
-                      {syncStatus.status === 'paused' ? 'Sync paused' : 'Syncing photos...'}
-                      {' '}{syncStatus.progress}%
-                      {syncStatus.message && (
-                        <Box component="span" sx={{ display: 'block' }}>
-                          {syncStatus.message}
-                        </Box>
-                      )}
+                    <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                      {syncState.processedItems} of {syncState.totalItems} items processed
                     </Typography>
                   </Box>
                 )}
-                
-                {syncStatus.status === 'completed' && (
-                  <Alert severity="success" sx={{ mb: 2 }}>
-                    Sync completed successfully!
-                  </Alert>
-                )}
-                
-                {syncStatus.status === 'cancelled' && (
-                  <Alert severity="info" sx={{ mb: 2 }}>
-                    Sync cancelled by user.
-                  </Alert>
-                )}
-                
-                {syncStatus.status === 'error' && (
-                  <Alert severity="error" sx={{ mb: 2 }}>
-                    {error || 'Sync failed. Please try again.'}
-                  </Alert>
-                )}
+
+                <Box sx={{ mt: 3, display: 'flex', gap: 2, justifyContent: 'center' }}>
+                  {syncState.status === 'running' || syncState.status === 'paused' ? (
+                    <>
+                      <Button
+                        variant="contained"
+                        color={syncState.isPaused ? "primary" : "warning"}
+                        startIcon={syncState.isPaused ? <PlayArrowIcon /> : <PauseIcon />}
+                        onClick={handlePauseResume}
+                      >
+                        {syncState.isPaused ? "Resume" : "Pause"}
+                      </Button>
+                      <Button
+                        variant="outlined"
+                        color="error"
+                        startIcon={<CancelIcon />}
+                        onClick={handleCancel}
+                      >
+                        Cancel
+                      </Button>
+                    </>
+                  ) : (
+                    <Button
+                      variant="contained"
+                      color="primary"
+                      startIcon={<SyncIcon />}
+                      onClick={handleSync}
+                      disabled={!syncEnabled}
+                    >
+                      Start Sync
+                    </Button>
+                  )}
+                </Box>
               </Box>
-            )}
-
-            <Box sx={{ mt: 3, display: 'flex', gap: 2, flexWrap: 'wrap' }}>
-              <Button 
-                variant="contained" 
-                color="primary" 
-                onClick={handleSync}
-                size={isMobile ? "medium" : "large"}
-                disabled={!syncEnabled}
-                startIcon={<SyncIcon />}
-              >
-                Start Sync
-              </Button>
-
-              {(syncStatus?.status === 'running' || syncStatus?.status === 'paused') && (
-                <>
-                  <Button
-                    variant="outlined"
-                    color="primary"
-                    onClick={handlePauseResume}
-                    size={isMobile ? "medium" : "large"}
-                    startIcon={syncStatus.isPaused ? <PlayArrowIcon /> : <PauseIcon />}
-                  >
-                    {syncStatus.isPaused ? 'Resume' : 'Pause'}
-                  </Button>
-                  <Button
-                    variant="outlined"
-                    color="error"
-                    onClick={handleCancel}
-                    size={isMobile ? "medium" : "large"}
-                    startIcon={<CancelIcon />}
-                  >
-                    Cancel
-                  </Button>
-                </>
-              )}
-            </Box>
-            
-            {!syncEnabled && !discovering && !discoveryResults && (
-              <Typography variant="body2" color="text.secondary" sx={{ mt: 2, textAlign: 'center' }}>
-                Run discovery first to enable sync
-              </Typography>
-            )}
-            
-            {!syncEnabled && discoveryResults?.totalItems === 0 && (
-              <Typography variant="body2" color="text.secondary" sx={{ mt: 2, textAlign: 'center' }}>
-                No items found to sync
-              </Typography>
             )}
           </Paper>
         </Grid>
